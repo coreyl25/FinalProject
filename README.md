@@ -88,11 +88,3 @@ Open new terminal windows** for each client and run:
 2. Send 50+ messages rapidly
 3. Stop the server (Ctrl+C)
 4. Check server statistics for cache hit rate
-
-
-### Test 6: Round-Robin Scheduling
-
-1. Start server
-2. Connect multiple clients
-3. Send messages from different clients
-4. Observe server logs for scheduling information
