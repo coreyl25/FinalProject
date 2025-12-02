@@ -56,14 +56,12 @@ Open new terminal windows** for each client and run:
 4. Type a message in the client
 5. Check that the message is logged on the server
 
-
 ### Test 2: Multi-Client Communication
 
 1. Start the server
 2. Connect 3-5 clients with different usernames
 3. Send messages from different clients
 4. Verify all clients receive broadcasted messages
-
 
 ### Test 3: Client Join/Leave Notifications
 
@@ -72,7 +70,6 @@ Open new terminal windows** for each client and run:
 3. Verify existing clients see "X has joined the chat"
 4. Disconnect a client using `/quit`
 5. Verify remaining clients see "X has left the chat"
-
 
 ### Test 4: Thread Pool Management
 
@@ -88,3 +85,11 @@ Open new terminal windows** for each client and run:
 2. Send 50+ messages rapidly
 3. Stop the server (Ctrl+C)
 4. Check server statistics for cache hit rate
+
+
+### Test 6: Round-Robin Scheduling
+
+1. Start server
+2. Connect multiple clients
+3. Send messages from different clients
+4. Observe server logs for scheduling information
