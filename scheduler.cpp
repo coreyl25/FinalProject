@@ -3,6 +3,9 @@
 
 RoundRobinScheduler::RoundRobinScheduler(int quantum_ms) 
     : head(nullptr), current(nullptr), client_count(0), time_quantum_ms(quantum_ms) {
+    if (quantum_ms <= 0) {
+        throw std::invalid_argument("Time quantum must be positive");
+    }
     std::cout << "[Scheduler] Initialized with " << time_quantum_ms << "ms time quantum" << std::endl;
 }
 
@@ -22,10 +25,23 @@ RoundRobinScheduler::~RoundRobinScheduler() {
     
     head = nullptr;
     current = nullptr;
+    client_count = 0;
 }
 
 void RoundRobinScheduler::add_client(int socket_fd, const std::string& user_id) {
     std::lock_guard<std::mutex> lock(scheduler_mutex);
+    
+    // Check if client already exists
+    if (head) {
+        ScheduledClient* temp = head;
+        do {
+            if (temp->socket_fd == socket_fd) {
+                std::cerr << "[Scheduler] Client " << socket_fd << " already exists" << std::endl;
+                return;
+            }
+            temp = temp->next;
+        } while (temp != head);
+    }
     
     ScheduledClient* new_client = new ScheduledClient(socket_fd, user_id);
     
@@ -47,7 +63,8 @@ void RoundRobinScheduler::add_client(int socket_fd, const std::string& user_id) 
     }
     
     client_count++;
-    std::cout << "[Scheduler] Added client " << user_id << " (fd: " << socket_fd << ")" << std::endl;
+    std::cout << "[Scheduler] Added client " << user_id << " (fd: " << socket_fd 
+              << "), total clients: " << client_count << std::endl;
 }
 
 void RoundRobinScheduler::remove_client(int socket_fd) {
@@ -58,6 +75,17 @@ void RoundRobinScheduler::remove_client(int socket_fd) {
     ScheduledClient* temp = head;
     ScheduledClient* prev = nullptr;
     
+    // Special case: only one client
+    if (head->next == head && head->socket_fd == socket_fd) {
+        std::cout << "[Scheduler] Removing last client " << head->user_id 
+                  << " (fd: " << socket_fd << ")" << std::endl;
+        delete head;
+        head = nullptr;
+        current = nullptr;
+        client_count = 0;
+        return;
+    }
+    
     // Find the last node (to get prev for head)
     ScheduledClient* last = head;
     while (last->next != head) {
@@ -66,21 +94,15 @@ void RoundRobinScheduler::remove_client(int socket_fd) {
     
     // Case 1: Removing head
     if (head->socket_fd == socket_fd) {
-        if (head->next == head) {
-            // Only one client
-            delete head;
-            head = nullptr;
-            current = nullptr;
-        } else {
-            // Multiple clients
-            last->next = head->next;
-            ScheduledClient* old_head = head;
-            head = head->next;
-            if (current == old_head) {
-                current = head;
-            }
-            delete old_head;
+        last->next = head->next;
+        ScheduledClient* old_head = head;
+        head = head->next;
+        if (current == old_head) {
+            current = head;
         }
+        std::cout << "[Scheduler] Removed client " << old_head->user_id 
+                  << " (fd: " << socket_fd << ")" << std::endl;
+        delete old_head;
         client_count--;
         return;
     }
@@ -95,6 +117,8 @@ void RoundRobinScheduler::remove_client(int socket_fd) {
             if (current == temp) {
                 current = temp->next;
             }
+            std::cout << "[Scheduler] Removed client " << temp->user_id 
+                      << " (fd: " << socket_fd << ")" << std::endl;
             delete temp;
             client_count--;
             return;
@@ -102,6 +126,8 @@ void RoundRobinScheduler::remove_client(int socket_fd) {
         prev = temp;
         temp = temp->next;
     }
+    
+    std::cerr << "[Scheduler] Client with fd " << socket_fd << " not found" << std::endl;
 }
 
 ScheduledClient* RoundRobinScheduler::get_next_client() {
@@ -119,10 +145,25 @@ ScheduledClient* RoundRobinScheduler::get_next_client() {
 }
 
 int RoundRobinScheduler::get_client_count() const {
+    std::lock_guard<std::mutex> lock(scheduler_mutex);
     return client_count;
 }
 
-void RoundRobinScheduler::print_schedule() {
+ScheduledClient* RoundRobinScheduler::find_client(int socket_fd) {
+    if (!head) return nullptr;
+    
+    ScheduledClient* temp = head;
+    do {
+        if (temp->socket_fd == socket_fd) {
+            return temp;
+        }
+        temp = temp->next;
+    } while (temp != head);
+    
+    return nullptr;
+}
+
+void RoundRobinScheduler::print_schedule() const {
     std::lock_guard<std::mutex> lock(scheduler_mutex);
     
     if (!head) {
