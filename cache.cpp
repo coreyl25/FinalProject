@@ -6,6 +6,9 @@
 
 MessageCache::MessageCache(int cap) 
     : capacity(cap), head(0), tail(0), size(0), hits(0), misses(0) {
+    if (capacity <= 0) {
+        throw std::invalid_argument("Cache capacity must be positive");
+    }
     cache.resize(capacity);
 }
 
@@ -13,13 +16,17 @@ MessageCache::~MessageCache() {
     // Cleanup handled by vector destructor
 }
 
-std::string MessageCache::generate_message_id(const std::string& sender, time_t timestamp) {
+std::string MessageCache::generate_message_id(const std::string& sender, time_t timestamp) const {
     std::stringstream ss;
     ss << sender << "_" << timestamp;
     return ss.str();
 }
 
-int MessageCache::find_lru_index() {
+int MessageCache::find_lru_index() const {
+    if (size == 0) {
+        return 0;
+    }
+    
     int lru_index = 0;
     time_t oldest_access = cache[0].last_access;
     
@@ -73,20 +80,20 @@ bool MessageCache::insert(const std::string& sender, const std::string& content,
     return true;
 }
 
-bool MessageCache::lookup(const std::string& message_id, std::string& content) {
+bool MessageCache::lookup(const std::string& message_id, std::string& content) const {
     std::shared_lock<std::shared_mutex> lock(cache_mutex);
     
     auto it = index_map.find(message_id);
     if (it != index_map.end()) {
         int index = it->second;
-        if (cache[index].valid) {
+        if (index >= 0 && index < size && cache[index].valid) {
             content = cache[index].content;
-            hits++;
+            const_cast<MessageCache*>(this)->hits++;
             return true;
         }
     }
     
-    misses++;
+    const_cast<MessageCache*>(this)->misses++;
     return false;
 }
 
@@ -96,7 +103,7 @@ void MessageCache::update_access(const std::string& message_id) {
     auto it = index_map.find(message_id);
     if (it != index_map.end()) {
         int index = it->second;
-        if (cache[index].valid) {
+        if (index >= 0 && index < size && cache[index].valid) {
             cache[index].last_access = time(nullptr);
             cache[index].access_count++;
         }
@@ -123,4 +130,20 @@ double MessageCache::get_hit_rate() const {
 int MessageCache::get_size() const {
     std::shared_lock<std::shared_mutex> lock(cache_mutex);
     return size;
+}
+
+void MessageCache::clear() {
+    std::unique_lock<std::shared_mutex> lock(cache_mutex);
+    
+    for (int i = 0; i < size; ++i) {
+        cache[i].valid = false;
+        cache[i].message_id.clear();
+        cache[i].content.clear();
+        cache[i].sender.clear();
+    }
+    
+    index_map.clear();
+    size = 0;
+    hits = 0;
+    misses = 0;
 }
