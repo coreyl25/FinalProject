@@ -4,6 +4,7 @@
 #include "common.h"
 #include <string>
 #include <mutex>
+#include <memory>
 
 struct ScheduledClient {
     int socket_fd;
@@ -15,23 +16,34 @@ struct ScheduledClient {
         : socket_fd(fd), user_id(id), last_scheduled(0), next(nullptr) {}
 };
 
+//Round-robin scheduler for fair client message processing
 class RoundRobinScheduler {
 private:
     ScheduledClient* head;
     ScheduledClient* current;
     int client_count;
-    std::mutex scheduler_mutex;
+    mutable std::mutex scheduler_mutex;
     int time_quantum_ms;
+    
+    // Helper method to find client node
+    ScheduledClient* find_client(int socket_fd);
 
 public:
-    RoundRobinScheduler(int quantum_ms = TIME_QUANTUM_MS);
+    explicit RoundRobinScheduler(int quantum_ms = TIME_QUANTUM_MS);
     ~RoundRobinScheduler();
+    
+    // Delete copy constructor and assignment operator
+    RoundRobinScheduler(const RoundRobinScheduler&) = delete;
+    RoundRobinScheduler& operator=(const RoundRobinScheduler&) = delete;
     
     void add_client(int socket_fd, const std::string& user_id);
     void remove_client(int socket_fd);
     ScheduledClient* get_next_client();
     int get_client_count() const;
-    void print_schedule();
+    void print_schedule() const;
+    
+    // Get time quantum
+    int get_time_quantum() const { return time_quantum_ms; }
 };
 
 #endif
