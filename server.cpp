@@ -18,6 +18,7 @@
 #include <cerrno>
 #include <chrono>
 #include <thread>
+#include <atomic>
 
 // Global variables
 std::map<int, ClientInfo> clients;
@@ -26,7 +27,7 @@ MessageCache message_cache(CACHE_SIZE);
 RoundRobinScheduler scheduler;
 PerformanceMetrics metrics;
 std::mutex metrics_mutex;
-bool server_running = true;
+std::atomic<bool> server_running(true);
 std::ofstream log_file;
 
 // Function prototypes
@@ -37,41 +38,50 @@ void update_metrics();
 void read_page_faults();
 void signal_handler(int signum);
 void print_statistics();
+bool setup_server_socket(int& server_socket);
+void cleanup_server(int server_socket);
 
 void log_message(const std::string& message) {
     time_t now = time(nullptr);
     char timestamp[64];
     strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", localtime(&now));
     
-    std::string log_entry = std::string(timestamp) + " - " + message + "\n";
-    std::cout << log_entry;
+    std::string log_entry = std::string(timestamp) + " - " + message;
+    std::cout << log_entry << std::endl;
     
     if (log_file.is_open()) {
-        log_file << log_entry;
+        log_file << log_entry << std::endl;
         log_file.flush();
     }
 }
 
 void read_page_faults() {
 #ifdef __linux__
-    std::ifstream status_file("/proc/self/status");
-    std::string line;
-    
-    while (std::getline(status_file, line)) {
-        if (line.find("VmHWM:") == 0 || line.find("VmRSS:") == 0) {
-            // For demonstration, we'll use simple counting
-            std::lock_guard<std::mutex> lock(metrics_mutex);
-            metrics.page_faults_minor++;
+    try {
+        std::ifstream status_file("/proc/self/status");
+        if (!status_file.is_open()) return;
+        
+        std::string line;
+        while (std::getline(status_file, line)) {
+            if (line.find("VmHWM:") == 0 || line.find("VmRSS:") == 0) {
+                std::lock_guard<std::mutex> lock(metrics_mutex);
+                metrics.page_faults_minor++;
+            }
         }
+    } catch (const std::exception& e) {
+        // Silently ignore errors reading page faults
     }
 #endif
 }
 
 void update_metrics() {
     std::lock_guard<std::mutex> lock(metrics_mutex);
-    std::lock_guard<std::mutex> clients_lock(clients_mutex);
     
-    metrics.active_clients = clients.size();
+    {
+        std::lock_guard<std::mutex> clients_lock(clients_mutex);
+        metrics.active_clients = static_cast<int>(clients.size());
+    }
+    
     metrics.cache_hits = message_cache.get_hits();
     metrics.cache_misses = message_cache.get_misses();
     
@@ -79,15 +89,32 @@ void update_metrics() {
 }
 
 void broadcast_message(const Message& msg, int sender_socket) {
-    std::lock_guard<std::mutex> lock(clients_mutex);
+    std::vector<int> failed_sockets;
     
-    for (auto& [socket_fd, client_info] : clients) {
-        if (socket_fd != sender_socket && client_info.active) {
-            ssize_t sent = send(socket_fd, &msg, sizeof(Message), 0);
-            if (sent > 0) {
-                std::lock_guard<std::mutex> metrics_lock(metrics_mutex);
-                metrics.messages_sent++;
+    {
+        std::lock_guard<std::mutex> lock(clients_mutex);
+        
+        for (auto& [socket_fd, client_info] : clients) {
+            if (socket_fd != sender_socket && client_info.active) {
+                ssize_t sent = send(socket_fd, &msg, sizeof(Message), MSG_NOSIGNAL);
+                if (sent > 0) {
+                    std::lock_guard<std::mutex> metrics_lock(metrics_mutex);
+                    metrics.messages_sent++;
+                } else {
+                    // Mark for cleanup
+                    failed_sockets.push_back(socket_fd);
+                }
             }
+        }
+    }
+    
+    // Clean up failed connections (do this outside the clients lock)
+    for (int fd : failed_sockets) {
+        std::lock_guard<std::mutex> lock(clients_mutex);
+        auto it = clients.find(fd);
+        if (it != clients.end()) {
+            log_message("Client connection lost: " + it->second.user_id);
+            it->second.active = false;
         }
     }
     
@@ -100,117 +127,133 @@ void handle_client(int client_socket) {
     Message msg;
     std::string user_id;
     
-    // Set socket timeout to allow checking server_running
-    struct timeval tv;
-    tv.tv_sec = 2;  // 2 second timeout
-    tv.tv_usec = 0;
-    setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    
-    // Receive initial user ID
-    ssize_t bytes = recv(client_socket, buffer, BUFFER_SIZE - 1, 0);
-    if (bytes <= 0) {
-        close(client_socket);
-        return;
-    }
-    
-    buffer[bytes] = '\0';
-    user_id = std::string(buffer);
-    
-    // Register client
-    {
-        std::lock_guard<std::mutex> lock(clients_mutex);
-        ClientInfo info;
-        info.socket_fd = client_socket;
-        info.user_id = user_id;
-        info.connect_time = time(nullptr);
-        info.last_active = time(nullptr);
-        info.active = true;
-        clients[client_socket] = info;
-        
-        std::lock_guard<std::mutex> metrics_lock(metrics_mutex);
-        metrics.active_clients++;
-    }
-    
-    // Add to scheduler
-    scheduler.add_client(client_socket, user_id);
-    
-    // Send join notification
-    Message join_msg;
-    join_msg.type = MSG_JOIN;
-    join_msg.timestamp = time(nullptr);
-    strncpy(join_msg.sender, user_id.c_str(), sizeof(join_msg.sender) - 1);
-    snprintf(join_msg.payload, sizeof(join_msg.payload), "%s has joined the chat", user_id.c_str());
-    broadcast_message(join_msg, client_socket);
-    
-    log_message("Client connected: " + user_id + " (fd: " + std::to_string(client_socket) + ")");
-    
-    // Main message loop
-    while (server_running) {
-        memset(&msg, 0, sizeof(msg));
-        bytes = recv(client_socket, &msg, sizeof(Message), 0);
-        
-        if (bytes < 0) {
-            // Check if it was a timeout
-            if (errno == EWOULDBLOCK || errno == EAGAIN) {
-                // Timeout - continue loop to check server_running
-                continue;
-            }
-            // Real error - client disconnected
-            break;
+    try {
+        // Set socket timeout to allow checking server_running
+        struct timeval tv;
+        tv.tv_sec = 1;  // 1 second timeout for faster shutdown
+        tv.tv_usec = 0;
+        if (setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+            log_message("Warning: Failed to set socket timeout");
         }
         
-        if (bytes == 0) {
-            // Client disconnected gracefully
-            break;
+        // Receive initial user ID
+        memset(buffer, 0, sizeof(buffer));
+        ssize_t bytes = recv(client_socket, buffer, BUFFER_SIZE - 1, 0);
+        if (bytes <= 0) {
+            close(client_socket);
+            return;
         }
         
-        {
-            std::lock_guard<std::mutex> metrics_lock(metrics_mutex);
-            metrics.messages_received++;
+        buffer[std::min(bytes, (ssize_t)(BUFFER_SIZE - 1))] = '\0';
+        user_id = std::string(buffer);
+        
+        // Validate user ID
+        if (user_id.empty() || user_id.length() > USERNAME_MAX_LEN) {
+            log_message("Invalid user ID received, disconnecting");
+            close(client_socket);
+            return;
         }
         
-        // Update last active time
+        // Register client
         {
             std::lock_guard<std::mutex> lock(clients_mutex);
-            if (clients.find(client_socket) != clients.end()) {
-                clients[client_socket].last_active = time(nullptr);
-            }
+            ClientInfo info;
+            info.socket_fd = client_socket;
+            info.user_id = user_id;
+            info.connect_time = time(nullptr);
+            info.last_active = time(nullptr);
+            info.active = true;
+            clients[client_socket] = info;
+            
+            std::lock_guard<std::mutex> metrics_lock(metrics_mutex);
+            metrics.active_clients++;
         }
         
-        // Process message based on type
-        switch (msg.type) {
-            case MSG_TEXT:
-                // Check cache for recent messages from same user (simulates deduplication)
-                {
-                    std::string recent_msg_id = user_id + "_" + std::to_string(msg.timestamp - 5);
+        // Add to scheduler
+        scheduler.add_client(client_socket, user_id);
+        
+        // Send join notification
+        Message join_msg;
+        memset(&join_msg, 0, sizeof(join_msg));
+        join_msg.type = MSG_JOIN;
+        join_msg.timestamp = time(nullptr);
+        join_msg.set_sender(user_id);
+        snprintf(join_msg.payload, sizeof(join_msg.payload), "%s has joined the chat", user_id.c_str());
+        join_msg.payload_size = strlen(join_msg.payload);
+        broadcast_message(join_msg, client_socket);
+        
+        log_message("Client connected: " + user_id + " (fd: " + std::to_string(client_socket) + ")");
+        
+        // Main message loop
+        while (server_running.load()) {
+            memset(&msg, 0, sizeof(msg));
+            bytes = recv(client_socket, &msg, sizeof(Message), 0);
+            
+            if (bytes < 0) {
+                // Check if it was a timeout
+                if (errno == EWOULDBLOCK || errno == EAGAIN) {
+                    // Timeout - continue loop to check server_running
+                    continue;
+                }
+                // Real error - client disconnected
+                break;
+            }
+            
+            if (bytes == 0 || bytes != sizeof(Message)) {
+                // Client disconnected or invalid message
+                break;
+            }
+            
+            {
+                std::lock_guard<std::mutex> metrics_lock(metrics_mutex);
+                metrics.messages_received++;
+            }
+            
+            // Update last active time
+            {
+                std::lock_guard<std::mutex> lock(clients_mutex);
+                auto it = clients.find(client_socket);
+                if (it != clients.end()) {
+                    it->second.last_active = time(nullptr);
+                }
+            }
+            
+            // Process message based on type
+            switch (msg.type) {
+                case MSG_TEXT: {
+                    // Ensure null-terminated strings
+                    msg.sender[sizeof(msg.sender) - 1] = '\0';
+                    msg.payload[sizeof(msg.payload) - 1] = '\0';
+                    
+                    // Check cache for recent messages from same user (simulates deduplication)
+                    std::string recent_msg_id = std::string(msg.sender) + "_" + 
+                                                std::to_string(msg.timestamp - 5);
                     std::string cached;
-                    message_cache.lookup(recent_msg_id, cached); // Attempt lookup
-                }
-                
-                msg.timestamp = time(nullptr);
-                broadcast_message(msg, client_socket);
-                log_message("Message from " + user_id + ": " + std::string(msg.payload));
-                
-                // Simulate cache hits by looking up recently sent messages
-                // This demonstrates the cache working in practice
-                for (int i = 1; i <= 3; i++) {
-                    std::string prev_msg_id = user_id + "_" + std::to_string(msg.timestamp - i);
-                    std::string cached_msg;
-                    if (message_cache.lookup(prev_msg_id, cached_msg)) {
-                        message_cache.update_access(prev_msg_id);
+                    message_cache.lookup(recent_msg_id, cached);
+                    
+                    msg.timestamp = time(nullptr);
+                    broadcast_message(msg, client_socket);
+                    log_message("Message from " + user_id + ": " + std::string(msg.payload));
+                    
+                    // Simulate cache hits by looking up recently sent messages
+                    for (int i = 1; i <= 3; i++) {
+                        std::string prev_msg_id = user_id + "_" + std::to_string(msg.timestamp - i);
+                        std::string cached_msg;
+                        if (message_cache.lookup(prev_msg_id, cached_msg)) {
+                            message_cache.update_access(prev_msg_id);
+                        }
                     }
+                    break;
                 }
-                break;
-                
-            case MSG_STATUS:
-                // Handle status request
-                update_metrics();
-                break;
-                
-            default:
-                log_message("Unknown message type from " + user_id);
-                break;
+                    
+                default:
+                    log_message("Unknown message type " + std::to_string(msg.type) + 
+                                " from " + user_id);
+                    break;
+            }
         }
+    } catch (const std::exception& e) {
+        log_message("Exception in handle_client: " + std::string(e.what()));
     }
     
     // Client cleanup
@@ -220,18 +263,24 @@ void handle_client(int client_socket) {
         std::lock_guard<std::mutex> lock(clients_mutex);
         clients.erase(client_socket);
         std::lock_guard<std::mutex> metrics_lock(metrics_mutex);
-        metrics.active_clients--;
+        if (metrics.active_clients > 0) {
+            metrics.active_clients--;
+        }
     }
     
-    // Send leave notification
-    Message leave_msg;
-    leave_msg.type = MSG_LEAVE;
-    leave_msg.timestamp = time(nullptr);
-    strncpy(leave_msg.sender, user_id.c_str(), sizeof(leave_msg.sender) - 1);
-    snprintf(leave_msg.payload, sizeof(leave_msg.payload), "%s has left the chat", user_id.c_str());
-    broadcast_message(leave_msg, -1);
-    
-    log_message("Client disconnected: " + user_id + " (fd: " + std::to_string(client_socket) + ")");
+    // Send leave notification if we have a user_id
+    if (!user_id.empty()) {
+        Message leave_msg;
+        memset(&leave_msg, 0, sizeof(leave_msg));
+        leave_msg.type = MSG_LEAVE;
+        leave_msg.timestamp = time(nullptr);
+        leave_msg.set_sender(user_id);
+        snprintf(leave_msg.payload, sizeof(leave_msg.payload), "%s has left the chat", user_id.c_str());
+        leave_msg.payload_size = strlen(leave_msg.payload);
+        broadcast_message(leave_msg, -1);
+        
+        log_message("Client disconnected: " + user_id + " (fd: " + std::to_string(client_socket) + ")");
+    }
     
     close(client_socket);
 }
@@ -239,9 +288,7 @@ void handle_client(int client_socket) {
 void print_statistics() {
     std::lock_guard<std::mutex> lock(metrics_mutex);
     
-    std::cout << "\n==================================" << std::endl;
     std::cout << "    SERVER STATISTICS" << std::endl;
-    std::cout << "==================================" << std::endl;
     std::cout << "Messages Sent:     " << metrics.messages_sent << std::endl;
     std::cout << "Messages Received: " << metrics.messages_received << std::endl;
     std::cout << "Active Clients:    " << metrics.active_clients << std::endl;
@@ -249,47 +296,40 @@ void print_statistics() {
     std::cout << "Cache Misses:      " << metrics.cache_misses << std::endl;
     std::cout << "Cache Hit Rate:    " << std::fixed << std::setprecision(2) 
               << message_cache.get_hit_rate() << "%" << std::endl;
-    std::cout << "==================================" << std::endl;
+    std::cout << "Cache Size:        " << message_cache.get_size() << "/" 
+              << message_cache.get_capacity() << std::endl;
 }
 
 void signal_handler(int signum) {
     (void)signum; // Suppress unused parameter warning
-    if (!server_running) {
+    
+    bool expected = true;
+    if (server_running.compare_exchange_strong(expected, false)) {
+        std::cout << "\n[Server] Interrupt signal received. Shutting down..." << std::endl;
+    } else {
         // Already shutting down, force exit
         std::cout << "\nForce quit..." << std::endl;
         exit(0);
     }
-    std::cout << "\n[Server] Interrupt signal received. Shutting down..." << std::endl;
-    server_running = false;
 }
 
-int main() {
-    // Setup signal handler
-    signal(SIGINT, signal_handler);
-    
-    // Open log file
-    log_file.open("server.log", std::ios::app);
-    if (!log_file.is_open()) {
-        std::cerr << "Warning: Could not open log file" << std::endl;
-    }
-    
-    log_message("========================================");
-    log_message("Server starting...");
-    
-    // Create thread pool
-    ThreadPool thread_pool(THREAD_POOL_SIZE);
-    
+bool setup_server_socket(int& server_socket) {
     // Create server socket
-    int server_socket = socket(AF_INET, SOCK_STREAM, 0);
+    server_socket = socket(AF_INET, SOCK_STREAM, 0);
     if (server_socket < 0) {
         log_message("ERROR: Failed to create socket");
-        return 1;
+        return false;
     }
     
     // Set socket options
     int opt = 1;
     if (setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-        log_message("WARNING: setsockopt failed");
+        log_message("WARNING: setsockopt SO_REUSEADDR failed");
+    }
+    
+    // Allow port reuse
+    if (setsockopt(server_socket, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) < 0) {
+        log_message("WARNING: setsockopt SO_REUSEPORT failed");
     }
     
     // Bind socket
@@ -300,69 +340,47 @@ int main() {
     server_addr.sin_port = htons(SERVER_PORT);
     
     if (bind(server_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        log_message("ERROR: Bind failed");
+        log_message("ERROR: Bind failed - port may be in use");
         close(server_socket);
-        return 1;
+        return false;
     }
     
     // Listen for connections
     if (listen(server_socket, MAX_CLIENTS) < 0) {
         log_message("ERROR: Listen failed");
         close(server_socket);
-        return 1;
+        return false;
     }
     
-    log_message("Server listening on port " + std::to_string(SERVER_PORT));
-    std::cout << "\nServer is running. Press Ctrl+C to stop.\n" << std::endl;
-    
-    // Main accept loop
-    while (server_running) {
-        struct sockaddr_in client_addr;
-        socklen_t client_len = sizeof(client_addr);
-        
-        // Set socket to non-blocking for clean shutdown
-        struct timeval tv;
-        tv.tv_sec = 1;  // 1 second timeout
-        tv.tv_usec = 0;
-        setsockopt(server_socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        
-        int client_socket = accept(server_socket, (struct sockaddr*)&client_addr, &client_len);
-        
-        if (client_socket < 0) {
-            if (!server_running) {
-                // Shutting down
-                break;
-            }
-            if (errno == EWOULDBLOCK || errno == EAGAIN) {
-                // Timeout, check if we should continue
-                continue;
-            }
-            log_message("ERROR: Accept failed");
-            continue;
-        }
-        
-        // Get client IP
-        char client_ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
-        log_message("New connection from " + std::string(client_ip));
-        
-        // Assign to thread pool
-        thread_pool.enqueue([client_socket]() {
-            handle_client(client_socket);
-        });
-        
-        {
-            std::lock_guard<std::mutex> lock(metrics_mutex);
-            metrics.active_threads = thread_pool.get_active_count();
-        }
-    }
-    
-    // Cleanup
+    return true;
+}
+
+void cleanup_server(int server_socket) {
     log_message("Shutting down server...");
+    
+    // First, close the server socket to stop accepting new connections
     close(server_socket);
     
-    // Wait a moment for threads to finish current operations
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    // Force close all client connections to unblock threads
+    {
+        std::lock_guard<std::mutex> lock(clients_mutex);
+        for (auto& [socket_fd, client_info] : clients) {
+            if (client_info.active) {
+                // Force immediate close without graceful shutdown
+                struct linger sl;
+                sl.l_onoff = 1;
+                sl.l_linger = 0;
+                setsockopt(socket_fd, SOL_SOCKET, SO_LINGER, &sl, sizeof(sl));
+                close(socket_fd);
+                client_info.active = false;
+            }
+        }
+        clients.clear();
+    }
+    
+    // Give threads a brief moment to detect closed sockets and exit
+    std::cout << "Waiting for threads to finish..." << std::endl;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     
     // Final statistics
     print_statistics();
@@ -371,6 +389,86 @@ int main() {
     
     if (log_file.is_open()) {
         log_file.close();
+    }
+}
+
+int main() {
+    // Setup signal handler
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+    
+    // Open log file
+    log_file.open("server.log", std::ios::app);
+    if (!log_file.is_open()) {
+        std::cerr << "Warning: Could not open log file" << std::endl;
+    }
+    
+    log_message("Server starting...");
+    
+    try {
+        // Create thread pool
+        ThreadPool thread_pool(THREAD_POOL_SIZE);
+        
+        int server_socket;
+        if (!setup_server_socket(server_socket)) {
+            return 1;
+        }
+        
+        log_message("Server listening on port " + std::to_string(SERVER_PORT));
+        std::cout << "\nServer is running. Press Ctrl+C to stop.\n" << std::endl;
+        
+        // Main accept loop
+        while (server_running.load()) {
+            struct sockaddr_in client_addr;
+            socklen_t client_len = sizeof(client_addr);
+            
+            // Set socket to non-blocking for clean shutdown
+            struct timeval tv;
+            tv.tv_sec = 1;  // 1 second timeout
+            tv.tv_usec = 0;
+            setsockopt(server_socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            
+            int client_socket = accept(server_socket, (struct sockaddr*)&client_addr, &client_len);
+            
+            if (client_socket < 0) {
+                if (!server_running.load()) {
+                    // Shutting down
+                    break;
+                }
+                if (errno == EWOULDBLOCK || errno == EAGAIN) {
+                    // Timeout, check if we should continue
+                    continue;
+                }
+                log_message("ERROR: Accept failed: " + std::string(strerror(errno)));
+                continue;
+            }
+            
+            // Get client IP
+            char client_ip[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
+            log_message("New connection from " + std::string(client_ip));
+            
+            // Assign to thread pool
+            try {
+                thread_pool.enqueue([client_socket]() {
+                    handle_client(client_socket);
+                });
+                
+                {
+                    std::lock_guard<std::mutex> lock(metrics_mutex);
+                    metrics.active_threads = thread_pool.get_active_count();
+                }
+            } catch (const std::exception& e) {
+                log_message("ERROR: Failed to enqueue client: " + std::string(e.what()));
+                close(client_socket);
+            }
+        }
+        
+        cleanup_server(server_socket);
+        
+    } catch (const std::exception& e) {
+        log_message("FATAL ERROR: " + std::string(e.what()));
+        return 1;
     }
     
     return 0;
