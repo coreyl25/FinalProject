@@ -8,29 +8,44 @@
 #include <thread>
 #include <atomic>
 #include <string>
+#include <chrono>
 
 std::atomic<bool> client_running(true);
 
 void receive_messages(int socket_fd) {
     Message msg;
     
-    while (client_running) {
+    while (client_running.load()) {
         memset(&msg, 0, sizeof(msg));
         ssize_t bytes = recv(socket_fd, &msg, sizeof(Message), 0);
         
         if (bytes <= 0) {
             // Connection closed or error
-            if (client_running) {
+            if (client_running.load()) {
                 std::cout << "\n[Server disconnected]" << std::endl;
-                client_running = false;
+                client_running.store(false);
             }
             break;
         }
         
+        if (bytes != sizeof(Message)) {
+            // Partial or invalid message received
+            continue;
+        }
+        
+        // Ensure null-terminated strings
+        msg.sender[sizeof(msg.sender) - 1] = '\0';
+        msg.payload[sizeof(msg.payload) - 1] = '\0';
+        
         // Display message based on type
         time_t timestamp = msg.timestamp;
         char time_str[64];
-        strftime(time_str, sizeof(time_str), "%H:%M:%S", localtime(&timestamp));
+        struct tm* tm_info = localtime(&timestamp);
+        if (tm_info) {
+            strftime(time_str, sizeof(time_str), "%H:%M:%S", tm_info);
+        } else {
+            strncpy(time_str, "??:??:??", sizeof(time_str) - 1);
+        }
         
         switch (msg.type) {
             case MSG_TEXT:
@@ -50,6 +65,7 @@ void receive_messages(int socket_fd) {
                 break;
                 
             default:
+                // Unknown message type, ignore
                 break;
         }
     }
@@ -59,20 +75,20 @@ void send_messages(int socket_fd, const std::string& user_id) {
     std::string input;
     Message msg;
     
-    while (client_running) {
+    while (client_running.load()) {
         std::cout << "You: " << std::flush;
         
         if (!std::getline(std::cin, input)) {
             // EOF or error on stdin
-            client_running = false;
+            client_running.store(false);
             break;
         }
         
-        if (!client_running) break;
+        if (!client_running.load()) break;
         
         // Check for exit command
         if (input == "/quit" || input == "/exit") {
-            client_running = false;
+            client_running.store(false);
             break;
         }
         
@@ -81,18 +97,7 @@ void send_messages(int socket_fd, const std::string& user_id) {
             std::cout << "\nAvailable commands:" << std::endl;
             std::cout << "  /quit, /exit - Disconnect from chat" << std::endl;
             std::cout << "  /help        - Show this help message" << std::endl;
-            std::cout << "  /stats       - Request server statistics" << std::endl;
             std::cout << std::endl;
-            continue;
-        }
-        
-        // Check for stats command
-        if (input == "/stats") {
-            msg.type = MSG_STATUS;
-            strncpy(msg.sender, user_id.c_str(), sizeof(msg.sender) - 1);
-            msg.timestamp = time(nullptr);
-            send(socket_fd, &msg, sizeof(Message), 0);
-            std::cout << "Statistics requested from server" << std::endl;
             continue;
         }
         
@@ -101,21 +106,70 @@ void send_messages(int socket_fd, const std::string& user_id) {
             continue;
         }
         
+        // Check message length
+        if (input.length() >= BUFFER_SIZE) {
+            std::cout << "[WARNING] Message too long, truncating to " << (BUFFER_SIZE - 1) 
+                      << " characters" << std::endl;
+            input = input.substr(0, BUFFER_SIZE - 1);
+        }
+        
         // Send text message
         memset(&msg, 0, sizeof(msg));
         msg.type = MSG_TEXT;
-        strncpy(msg.sender, user_id.c_str(), sizeof(msg.sender) - 1);
-        strncpy(msg.payload, input.c_str(), sizeof(msg.payload) - 1);
+        msg.set_sender(user_id);
+        msg.set_payload(input);
         msg.timestamp = time(nullptr);
-        msg.payload_size = strlen(msg.payload);
         
-        ssize_t sent = send(socket_fd, &msg, sizeof(Message), 0);
+        ssize_t sent = send(socket_fd, &msg, sizeof(Message), MSG_NOSIGNAL);
         if (sent <= 0) {
             std::cout << "\n[ERROR] Failed to send message" << std::endl;
-            client_running = false;
+            client_running.store(false);
             break;
         }
     }
+}
+
+bool connect_to_server(const std::string& server_ip, int server_port, 
+                       const std::string& user_id, int& client_socket) {
+    // Create socket
+    client_socket = socket(AF_INET, SOCK_STREAM, 0);
+    if (client_socket < 0) {
+        std::cerr << "ERROR: Failed to create socket" << std::endl;
+        return false;
+    }
+    
+    // Setup server address
+    struct sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(server_port);
+    
+    if (inet_pton(AF_INET, server_ip.c_str(), &server_addr.sin_addr) <= 0) {
+        std::cerr << "ERROR: Invalid server address: " << server_ip << std::endl;
+        close(client_socket);
+        return false;
+    }
+    
+    // Connect to server with timeout
+    std::cout << "Connecting to server at " << server_ip << ":" << server_port << "..." << std::endl;
+    
+    if (connect(client_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        std::cerr << "ERROR: Connection failed. Is the server running?" << std::endl;
+        close(client_socket);
+        return false;
+    }
+    
+    std::cout << "Connected to server!" << std::endl;
+    
+    // Send user ID to server
+    ssize_t sent = send(client_socket, user_id.c_str(), user_id.length(), MSG_NOSIGNAL);
+    if (sent <= 0) {
+        std::cerr << "ERROR: Failed to send user ID to server" << std::endl;
+        close(client_socket);
+        return false;
+    }
+    
+    return true;
 }
 
 int main(int argc, char* argv[]) {
@@ -128,12 +182,29 @@ int main(int argc, char* argv[]) {
         user_id = argv[1];
     } else {
         std::cout << "Enter your username: ";
-        std::getline(std::cin, user_id);
+        if (!std::getline(std::cin, user_id)) {
+            std::cerr << "ERROR: Failed to read username" << std::endl;
+            return 1;
+        }
     }
     
+    // Validate username
     if (user_id.empty()) {
         std::cerr << "ERROR: Username cannot be empty" << std::endl;
         return 1;
+    }
+    
+    if (user_id.length() > USERNAME_MAX_LEN) {
+        std::cerr << "ERROR: Username too long (max " << USERNAME_MAX_LEN << " characters)" << std::endl;
+        return 1;
+    }
+    
+    // Check for invalid characters
+    for (char c : user_id) {
+        if (!isprint(c) || c == '\n' || c == '\r') {
+            std::cerr << "ERROR: Username contains invalid characters" << std::endl;
+            return 1;
+        }
     }
     
     if (argc >= 3) {
@@ -141,41 +212,22 @@ int main(int argc, char* argv[]) {
     }
     
     if (argc >= 4) {
-        server_port = std::stoi(argv[3]);
+        try {
+            server_port = std::stoi(argv[3]);
+            if (server_port <= 0 || server_port > 65535) {
+                std::cerr << "ERROR: Invalid port number (must be 1-65535)" << std::endl;
+                return 1;
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "ERROR: Invalid port number: " << argv[3] << std::endl;
+            return 1;
+        }
     }
     
-    // Create socket
-    int client_socket = socket(AF_INET, SOCK_STREAM, 0);
-    if (client_socket < 0) {
-        std::cerr << "ERROR: Failed to create socket" << std::endl;
+    int client_socket;
+    if (!connect_to_server(server_ip, server_port, user_id, client_socket)) {
         return 1;
     }
-    
-    // Setup server address
-    struct sockaddr_in server_addr;
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(server_port);
-    
-    if (inet_pton(AF_INET, server_ip.c_str(), &server_addr.sin_addr) <= 0) {
-        std::cerr << "ERROR: Invalid server address" << std::endl;
-        close(client_socket);
-        return 1;
-    }
-    
-    // Connect to server
-    std::cout << "Connecting to server at " << server_ip << ":" << server_port << "..." << std::endl;
-    
-    if (connect(client_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        std::cerr << "ERROR: Connection failed. Is the server running?" << std::endl;
-        close(client_socket);
-        return 1;
-    }
-    
-    std::cout << "Connected to server!" << std::endl;
-    
-    // Send user ID to server
-    send(client_socket, user_id.c_str(), user_id.length(), 0);
     
     std::cout << "\nWelcome to the chat, " << user_id << "!" << std::endl;
     std::cout << "Type /help for available commands" << std::endl;
@@ -189,13 +241,13 @@ int main(int argc, char* argv[]) {
     
     // Cleanup
     std::cout << "\nDisconnecting from server..." << std::endl;
-    client_running = false;
+    client_running.store(false);
     
     // Shutdown socket to wake up receiver thread
     shutdown(client_socket, SHUT_RDWR);
     close(client_socket);
     
-    // Wait for receiver thread to finish
+    // Wait for receiver thread to finish (with timeout)
     if (receiver_thread.joinable()) {
         receiver_thread.join();
     }
