@@ -1,11 +1,10 @@
 #ifndef CACHE_H
 #define CACHE_H
-
 #include "common.h"
 #include <vector>
 #include <mutex>
 #include <shared_mutex>
-#include <map>
+#include <unordered_map>
 #include <string>
 
 class MessageCache {
@@ -13,29 +12,43 @@ private:
     std::vector<CacheEntry> cache;
     int capacity;
     int head;
-    int tail;
+    int tail;  // Not currently used but kept for future circular buffer implementation
     int size;
-    std::map<std::string, int> index_map;
+    std::unordered_map<std::string, int> index_map; 
     mutable std::shared_mutex cache_mutex;
     
     uint64_t hits;
     uint64_t misses;
     
-    int find_lru_index();
-    std::string generate_message_id(const std::string& sender, time_t timestamp);
+    // Private helper methods
+    int find_lru_index() const;
+    std::string generate_message_id(const std::string& sender, time_t timestamp) const;
 
 public:
-    MessageCache(int capacity = CACHE_SIZE);
+    explicit MessageCache(int capacity = CACHE_SIZE);
     ~MessageCache();
     
+    // Delete copy constructor and assignment operator
+    MessageCache(const MessageCache&) = delete;
+    MessageCache& operator=(const MessageCache&) = delete;
+    
+    // Allow move operations
+    MessageCache(MessageCache&&) noexcept = default;
+    MessageCache& operator=(MessageCache&&) noexcept = default;
+    
     bool insert(const std::string& sender, const std::string& content, time_t timestamp);
-    bool lookup(const std::string& message_id, std::string& content);
+    bool lookup(const std::string& message_id, std::string& content) const;
     void update_access(const std::string& message_id);
     
+    // Const getters
     uint64_t get_hits() const;
     uint64_t get_misses() const;
     double get_hit_rate() const;
     int get_size() const;
+    int get_capacity() const { return capacity; }
+    
+    // Clear cache
+    void clear();
 };
 
 #endif
