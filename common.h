@@ -4,26 +4,41 @@
 #include <string>
 #include <cstdint>
 #include <ctime>
+#include <cstring>
 
 // Server configuration
-#define SERVER_PORT 8080
-#define MAX_CLIENTS 50
-#define THREAD_POOL_SIZE 6
-#define BUFFER_SIZE 4096
-#define CACHE_SIZE 50
-#define TIME_QUANTUM_MS 100
+constexpr int SERVER_PORT = 8080;
+constexpr int MAX_CLIENTS = 50;
+constexpr int THREAD_POOL_SIZE = 6;
+constexpr int BUFFER_SIZE = 4096;
+constexpr int CACHE_SIZE = 10;
+constexpr int TIME_QUANTUM_MS = 100;
+constexpr int USERNAME_MAX_LEN = 63;  // 64 - 1 for null terminator
 
 // Message types
-#define MSG_TEXT 0x01
-#define MSG_JOIN 0x02
-#define MSG_LEAVE 0x03
-#define MSG_AUDIO 0x04
-#define MSG_VIDEO 0x05
-#define MSG_STATUS 0x06
+enum class MessageType : uint8_t {
+    TEXT = 0x01,
+    JOIN = 0x02,
+    LEAVE = 0x03,
+    AUDIO = 0x04,
+    VIDEO = 0x05,
+    STATUS = 0x06,
+    CACHE_TEST = 0x07  // New type for cache testing
+};
 
-// Message structure
+// Legacy defines for backward compatibility
+#define MSG_TEXT static_cast<uint8_t>(MessageType::TEXT)
+#define MSG_JOIN static_cast<uint8_t>(MessageType::JOIN)
+#define MSG_LEAVE static_cast<uint8_t>(MessageType::LEAVE)
+#define MSG_AUDIO static_cast<uint8_t>(MessageType::AUDIO)
+#define MSG_VIDEO static_cast<uint8_t>(MessageType::VIDEO)
+#define MSG_STATUS static_cast<uint8_t>(MessageType::STATUS)
+#define MSG_CACHE_TEST static_cast<uint8_t>(MessageType::CACHE_TEST)
+
+// Message structure with better memory alignment
 struct Message {
     uint8_t type;
+    uint8_t padding1[3];  // Explicit padding for alignment
     uint32_t user_id;
     uint32_t payload_size;
     char sender[64];
@@ -31,8 +46,22 @@ struct Message {
     time_t timestamp;
     
     Message() : type(0), user_id(0), payload_size(0), timestamp(0) {
-        sender[0] = '\0';
-        payload[0] = '\0';
+        memset(padding1, 0, sizeof(padding1));
+        memset(sender, 0, sizeof(sender));
+        memset(payload, 0, sizeof(payload));
+    }
+    
+    // Helper method to safely set sender
+    void set_sender(const std::string& name) {
+        strncpy(sender, name.c_str(), sizeof(sender) - 1);
+        sender[sizeof(sender) - 1] = '\0';  // Ensure null termination
+    }
+    
+    // Helper method to safely set payload
+    void set_payload(const std::string& content) {
+        strncpy(payload, content.c_str(), sizeof(payload) - 1);
+        payload[sizeof(payload) - 1] = '\0';  // Ensure null termination
+        payload_size = strlen(payload);
     }
 };
 
